@@ -1,4 +1,3 @@
-#!pip install datasets
 # ===================================================================
 # Step 1 (for Kaggle TPU): Install PyTorch/XLA - Run this once in a separate cell
 # ===================================================================
@@ -21,7 +20,14 @@ import os
 import re
 from collections import Counter
 import pandas as pd
-from datasets import load_dataset
+# Use try-except for environments where datasets might not be pre-installed
+try:
+    from datasets import load_dataset
+except ImportError:
+    print("Installing 'datasets' library...")
+    !pip install -q datasets
+    from datasets import load_dataset
+
 
 # --- 1. Environment Detection and Universal Setup ---
 try:
@@ -40,13 +46,15 @@ FLAGS = {
     "embed_dim": 64,
     "hidden_dim": 128,
     "ff_dim": 256,
-    "total_batch_size": 64,
-    "num_epochs": 5, # Reduced for faster experimentation on multiple sequence lengths
+    "total_batch_size": 128,
+    "num_epochs": 5,
     "learning_rate": 1e-4,
     "weight_decay": 1e-2,
     "num_heads": 4,
-    "num_workers": 2,
-    "sequence_lengths": [128, 256, 512], # Sequence lengths to test
+    # ✅ FIX: Set num_workers to 0 to avoid multiprocessing issues in notebook environments.
+    # This is the most robust solution for the "can only test a child process" error.
+    "num_workers": 0,
+    "sequence_lengths": [128, 256, 512],
 }
 
 # --- 3. Refactored Zarvan Model Architecture (B, S, E) ---
@@ -91,10 +99,10 @@ class ZarvanBlock(nn.Module):
         self.gate_net = nn.Sequential(
             nn.Linear(embed_dim * 3, hidden_dim), 
             nn.GELU(),
-            nn.Linear(hidden_dim, embed_dim * 2) # Outputs 2 gates
+            nn.Linear(hidden_dim, embed_dim * 2)
         )
         self.norm = nn.LayerNorm(embed_dim)
-        self.ffn = nn.Sequential( # Feed-forward network after gating
+        self.ffn = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, embed_dim)
@@ -109,9 +117,8 @@ class ZarvanBlock(nn.Module):
         i_ctx_exp = i_ctx.unsqueeze(1).expand(-1, S, -1)
         gate_input = torch.cat([x, q_exp, i_ctx_exp], dim=-1)
         
-        # Calculate gate values
         gates = self.gate_net(gate_input)
-        input_gate, forget_gate = gates.chunk(2, dim=-1) # Split into two gates
+        input_gate, forget_gate = gates.chunk(2, dim=-1)
         
         input_gate = torch.sigmoid(input_gate)
         forget_gate = torch.sigmoid(forget_gate)
@@ -148,10 +155,11 @@ class TransformerIMDBClassifier(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
         self.fc = nn.Linear(embed_dim, num_classes)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, src_key_padding_mask: torch.Tensor):
         x = self.embedding(x)
         x = self.pos_encoder(x)
-        x = self.transformer(x)
+        # Pass the padding mask to the transformer
+        x = self.transformer(x, src_key_padding_mask=src_key_padding_mask)
         z = x.mean(dim=1)
         return self.fc(z)
 
@@ -185,24 +193,33 @@ class IMDbDataset(Dataset):
 def collate_fn(batch, pad_idx):
     texts, labels = zip(*batch)
     texts_padded = nn.utils.rnn.pad_sequence(texts, batch_first=True, padding_value=pad_idx)
-    return texts_padded, torch.tensor(labels)
+    # Create the padding mask where True indicates a padded element
+    padding_mask = (texts_padded == pad_idx)
+    return texts_padded, torch.tensor(labels), padding_mask
 
 # --- 6. Universal Training & Evaluation Functions ---
-def run_epoch(is_training, model, loader, optimizer, criterion, device):
+def run_epoch(is_training, model_name, model, loader, optimizer, criterion, device):
     model.train(is_training)
     total_loss, total_correct, total_samples = 0, 0, 0
-    progress_bar = tqdm(loader, desc="Training" if is_training else "Evaluating", leave=False)
+    progress_bar = tqdm(loader, desc=f"{model_name} Training" if is_training else f"{model_name} Evaluating", leave=False)
     
     with torch.set_grad_enabled(is_training):
-        for data, target in progress_bar:
-            output = model(data)
+        for data, target, mask in progress_bar:
+            data, target, mask = data.to(device), target.to(device), mask.to(device)
+            
+            if model_name == "Transformer":
+                output = model(data, src_key_padding_mask=mask)
+            else:
+                output = model(data)
+                
             loss = criterion(output, target)
             if is_training:
                 optimizer.zero_grad()
                 loss.backward()
                 if IS_TPU: xm.optimizer_step(optimizer)
                 else: optimizer.step()
-            total_loss += loss.item()
+            
+            total_loss += loss.item() * data.size(0)
             total_correct += (output.argmax(1) == target).sum().item()
             total_samples += target.size(0)
 
@@ -210,11 +227,12 @@ def run_epoch(is_training, model, loader, optimizer, criterion, device):
         total_correct = xm.mesh_reduce('val_correct', total_correct, sum)
         total_samples = xm.mesh_reduce('val_samples', total_samples, sum)
 
-    return 100. * total_correct / total_samples
+    avg_loss = total_loss / total_samples
+    accuracy = 100. * total_correct / total_samples
+    return avg_loss, accuracy
 
 # --- 7. Main Execution Logic ---
 def main():
-    # --- Device and Batch Size Setup ---
     if IS_TPU:
         rank = xm.get_ordinal()
         device = xm.xla_device()
@@ -225,19 +243,19 @@ def main():
         batch_size = FLAGS['total_batch_size']
 
     if rank == 0:
-        print(f"Running on: {device} | Global Batch Size: {FLAGS['total_batch_size']}")
+        print(f"Running on: {str(device).upper()} | Global Batch Size: {FLAGS['total_batch_size']}")
 
-    # --- Data Loading ---
-    if rank == 0:
+    data_file = 'imdb_data.pth'
+    if rank == 0 and not os.path.exists(data_file):
         print("Loading IMDb dataset and building vocabulary...")
         imdb = load_dataset("imdb")
         word_counter = Counter(t for item in tqdm(imdb['train'], desc="Building vocab") for t in simple_tokenizer(item['text']))
         vocab = Vocab(word_counter)
-        torch.save((imdb, vocab), 'imdb_data.pth')
+        torch.save((imdb, vocab), data_file)
     
     if IS_TPU: xm.rendezvous('download_complete')
 
-    imdb, vocab = torch.load('imdb_data.pth', weights_only=False)
+    imdb, vocab = torch.load(data_file, map_location='cpu', weights_only=False)
     if rank == 0: print(f"Vocabulary size: {len(vocab)}")
     
     results_summary = []
@@ -258,10 +276,10 @@ def main():
         collate_with_padding = lambda batch: collate_fn(batch, vocab.stoi['<pad>'])
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, sampler=train_sampler,
-            shuffle=(train_sampler is None), num_workers=FLAGS['num_workers'], collate_fn=collate_with_padding)
+            shuffle=(train_sampler is None), num_workers=FLAGS['num_workers'], collate_fn=collate_with_padding, pin_memory=not IS_TPU)
         test_loader = DataLoader(
             test_dataset, batch_size=batch_size, shuffle=False,
-            num_workers=FLAGS['num_workers'], collate_fn=collate_with_padding)
+            num_workers=FLAGS['num_workers'], collate_fn=collate_with_padding, pin_memory=not IS_TPU)
 
         if IS_TPU:
             train_loader = pl.MpDeviceLoader(train_loader, device)
@@ -280,31 +298,35 @@ def main():
             start_time = time.time()
             
             for epoch in range(1, FLAGS['num_epochs'] + 1):
-                run_epoch(True, model, train_loader, optimizer, criterion, device)
-                if rank == 0: print(f"Epoch {epoch}/{FLAGS['num_epochs']} completed.")
+                train_loss, train_acc = run_epoch(True, name, model, train_loader, optimizer, criterion, device)
+                if rank == 0: 
+                    print(f"Epoch {epoch}/{FLAGS['num_epochs']} -> Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
 
-            eval_acc = run_epoch(False, model, test_loader, None, criterion, device)
+            eval_loss, eval_acc = run_epoch(False, name, model, test_loader, None, criterion, device)
             total_time = time.time() - start_time
             
             if rank == 0:
                 print(f"Final Accuracy for {name} (S={seq_len}): {eval_acc:.2f}% | Total Time: {total_time:.2f}s")
                 results_summary.append({'seq_len': seq_len, 'model': name, 'accuracy': eval_acc, 'time': total_time})
 
-    # --- Final Report and Plotting ---
     if rank == 0:
         print("\n\n" + "="*50); print("FINAL SCALABILITY RESULTS"); print("="*50)
         df = pd.DataFrame(results_summary)
         print(df.to_string())
 
+        plt.style.use('seaborn-v0_8-whitegrid')
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7))
+        fig.suptitle(f'Zarvan vs. Transformer on IMDb ({str(device).upper()})', fontsize=16)
+        
         for model_name, marker, color in [('Zarvan', 'o', 'blue'), ('Transformer', 's', 'red')]:
             model_df = df[df['model'] == model_name]
             ax1.plot(model_df['seq_len'], model_df['accuracy'], marker=marker, color=color, label=f'{model_name} Accuracy')
             ax2.plot(model_df['seq_len'], model_df['time'], marker=marker, color=color, label=f'{model_name} Time')
+        
         ax1.set_title('Accuracy vs. Sequence Length'); ax1.set_xlabel('Sequence Length'); ax1.set_ylabel('Final Test Accuracy (%)')
         ax2.set_title('Training Time vs. Sequence Length'); ax2.set_xlabel('Sequence Length'); ax2.set_ylabel('Time (seconds)')
         for ax in [ax1, ax2]: ax.grid(True); ax.legend()
-        plt.tight_layout()
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.savefig('scalability_universal_results.png')
         print("\nSaved plot to 'scalability_universal_results.png'")
 
@@ -313,6 +335,6 @@ if __name__ == '__main__':
     if IS_TPU:
         def _mp_fn_wrapper(rank, flags):
             main()
-        xmp.spawn(_mp_fn_wrapper, args=(FLAGS,), nprocs=1, start_method='fork')
+        xmp.spawn(_mp_fn_wrapper, args=(FLAGS,), nprocs=None, start_method='fork')
     else:
         main()
