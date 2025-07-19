@@ -1,11 +1,11 @@
 # ===================================================================
-# Step 1 (for Kaggle TPU): Install PyTorch/XLA - Run this once in a separate cell
-# ===================================================================
-# !curl https://raw.githubusercontent.com/pytorch/xla/master/contrib/scripts/env-setup.py -o pytorch-xla-env-setup.py
-# !python pytorch-xla-env-setup.py --version 2.0.0 --apt-packages libomp5
-
-# ===================================================================
-# Step 2: Main Universal Script - Run this in the next cell
+#
+#   IMDb Scalability Benchmark: Definitive Zarvan vs. Transformer
+#
+# This script runs a comprehensive benchmark comparing the final, hybrid
+# Zarvan architecture against a standard Transformer baseline on the
+# IMDb sentiment classification task across various sequence lengths.
+#
 # ===================================================================
 import torch
 import torch.nn as nn
@@ -43,23 +43,24 @@ except ImportError:
 
 # --- 2. Configuration (FLAGS) ---
 FLAGS = {
-    "embed_dim": 64,
-    "hidden_dim": 128,
-    "ff_dim": 256,
+    "embed_dim": 128,
+    "hidden_dim": 256,
+    "ff_dim": 512, # Feed-forward dim for Transformer
     "total_batch_size": 128,
     "num_epochs": 5,
     "learning_rate": 1e-4,
     "weight_decay": 1e-2,
     "num_heads": 4,
-    # ✅ FIX: Set num_workers to 0 to avoid multiprocessing issues in notebook environments.
-    # This is the most robust solution for the "can only test a child process" error.
-    "num_workers": 0,
+    "num_layers": 2, # Using a 2-layer stack for both models
+    "num_workers": 0, # Set to 0 to avoid multiprocessing issues in notebooks
     "sequence_lengths": [128, 256, 512],
 }
 
-# --- 3. Refactored Zarvan Model Architecture (B, S, E) ---
+# ============================================================================
+# Part 3: Definitive Zarvan Architecture
+# ============================================================================
 
-class SinusoidalPositionalEncoding(nn.Module):
+class PositionalEncoding(nn.Module):
     def __init__(self, embed_dim: int, max_len: int = 2048):
         super().__init__()
         position = torch.arange(max_len).unsqueeze(1)
@@ -72,7 +73,7 @@ class SinusoidalPositionalEncoding(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.pe[:, :x.size(1), :]
 
-class LinearQueryExtractor(nn.Module):
+class HolisticContextExtractor(nn.Module):
     def __init__(self, embed_dim: int, num_heads: int):
         super().__init__()
         self.embed_dim, self.num_heads = embed_dim, num_heads
@@ -91,74 +92,81 @@ class LinearQueryExtractor(nn.Module):
         concatenated_heads = head_outputs.reshape(B, self.embed_dim)
         return self.combine(concatenated_heads)
 
+class AssociativeContextExtractor(nn.Module):
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        self.importance_scorer = nn.Sequential(nn.Linear(embed_dim, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        scores = self.importance_scorer(x)
+        weights = F.softmax(scores, dim=1)
+        context = torch.sum(weights * x, dim=1)
+        return context
+
 class ZarvanBlock(nn.Module):
     def __init__(self, embed_dim: int, hidden_dim: int, num_heads: int):
         super().__init__()
-        self.query_extractor = LinearQueryExtractor(embed_dim, num_heads)
-        self.interactive_context = nn.Linear(embed_dim, embed_dim)
+        self.holistic_ctx = HolisticContextExtractor(embed_dim, num_heads)
+        self.associative_ctx = AssociativeContextExtractor(embed_dim)
         self.gate_net = nn.Sequential(
-            nn.Linear(embed_dim * 3, hidden_dim), 
+            nn.Linear(embed_dim * 3, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, embed_dim * 2)
         )
+        self.update_proj = nn.Linear(embed_dim, embed_dim)
         self.norm = nn.LayerNorm(embed_dim)
         self.ffn = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, embed_dim)
         )
-        self.gated_proj = nn.Linear(embed_dim, embed_dim)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, S, E = x.shape
-        q = self.query_extractor(x)
-        i_ctx = F.gelu(self.interactive_context(q))
-        q_exp = q.unsqueeze(1).expand(-1, S, -1)
-        i_ctx_exp = i_ctx.unsqueeze(1).expand(-1, S, -1)
-        gate_input = torch.cat([x, q_exp, i_ctx_exp], dim=-1)
-        
-        gates = self.gate_net(gate_input)
-        input_gate, forget_gate = gates.chunk(2, dim=-1)
-        
-        input_gate = torch.sigmoid(input_gate)
-        forget_gate = torch.sigmoid(forget_gate)
-        
-        gated_x = input_gate * x + forget_gate * self.gated_proj(x) 
-        ffn_input = gated_x + i_ctx_exp + q_exp
-        output = self.ffn(ffn_input)
+        q_holistic = self.holistic_ctx(x)
+        q_associative = self.associative_ctx(x)
+        q_holistic_exp = q_holistic.unsqueeze(1).expand(-1, S, -1)
+        q_associative_exp = q_associative.unsqueeze(1).expand(-1, S, -1)
+        gate_input = torch.cat([x, q_holistic_exp, q_associative_exp], dim=-1)
+        input_gate, forget_gate = self.gate_net(gate_input).chunk(2, dim=-1)
+        gated_x = torch.sigmoid(input_gate) * x + torch.sigmoid(forget_gate) * self.update_proj(x)
+        output = self.ffn(gated_x)
         return self.norm(x + output)
 
 # --- 4. Classifier Models for IMDb ---
 class ZarvanIMDBClassifier(nn.Module):
-    def __init__(self, vocab_size, seq_len, embed_dim, hidden_dim, num_classes, num_heads, padding_idx):
+    def __init__(self, vocab_size, seq_len, embed_dim, hidden_dim, num_classes, num_heads, num_layers, padding_idx):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=padding_idx)
-        self.pos_encoder = SinusoidalPositionalEncoding(embed_dim, max_len=seq_len)
-        self.zarvan_block = ZarvanBlock(embed_dim, hidden_dim, num_heads)
+        self.pos_encoder = PositionalEncoding(embed_dim, max_len=seq_len)
+        self.layers = nn.ModuleList([
+            ZarvanBlock(embed_dim, hidden_dim, num_heads) for _ in range(num_layers)
+        ])
         self.fc = nn.Linear(embed_dim, num_classes)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.embedding(x)
         x = self.pos_encoder(x)
-        x = self.zarvan_block(x)
-        z = x.mean(dim=1)
+        for layer in self.layers:
+            x = layer(x)
+        z = x.mean(dim=1) # Global average pooling
         return self.fc(z)
 
 class TransformerIMDBClassifier(nn.Module):
-    def __init__(self, vocab_size, seq_len, embed_dim, ff_dim, num_classes, num_heads, padding_idx):
+    def __init__(self, vocab_size, seq_len, embed_dim, ff_dim, num_classes, num_heads, num_layers, padding_idx):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=padding_idx)
-        self.pos_encoder = SinusoidalPositionalEncoding(embed_dim, max_len=seq_len)
+        self.pos_encoder = PositionalEncoding(embed_dim, max_len=seq_len)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim, nhead=num_heads, dim_feedforward=ff_dim,
             dropout=0.1, batch_first=True, activation='gelu')
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.fc = nn.Linear(embed_dim, num_classes)
 
-    def forward(self, x: torch.Tensor, src_key_padding_mask: torch.Tensor):
+    def forward(self, x: torch.Tensor, src_key_padding_mask: torch.Tensor) -> torch.Tensor:
         x = self.embedding(x)
         x = self.pos_encoder(x)
-        # Pass the padding mask to the transformer
+        # ✅ Pass the padding mask to the transformer for a fair comparison
         x = self.transformer(x, src_key_padding_mask=src_key_padding_mask)
         z = x.mean(dim=1)
         return self.fc(z)
@@ -193,7 +201,7 @@ class IMDbDataset(Dataset):
 def collate_fn(batch, pad_idx):
     texts, labels = zip(*batch)
     texts_padded = nn.utils.rnn.pad_sequence(texts, batch_first=True, padding_value=pad_idx)
-    # Create the padding mask where True indicates a padded element
+    # ✅ Create the padding mask where True indicates a padded element
     padding_mask = (texts_padded == pad_idx)
     return texts_padded, torch.tensor(labels), padding_mask
 
@@ -207,9 +215,9 @@ def run_epoch(is_training, model_name, model, loader, optimizer, criterion, devi
         for data, target, mask in progress_bar:
             data, target, mask = data.to(device), target.to(device), mask.to(device)
             
-            if model_name == "Transformer":
+            if "Transformer" in model_name:
                 output = model(data, src_key_padding_mask=mask)
-            else:
+            else: # Zarvan does not need a mask
                 output = model(data)
                 
             loss = criterion(output, target)
@@ -247,7 +255,7 @@ def main():
 
     data_file = 'imdb_data.pth'
     if rank == 0 and not os.path.exists(data_file):
-        print("Loading IMDb dataset and building vocabulary...")
+        print("Loading IMDb dataset from Hugging Face and building vocabulary...")
         imdb = load_dataset("imdb")
         word_counter = Counter(t for item in tqdm(imdb['train'], desc="Building vocab") for t in simple_tokenizer(item['text']))
         vocab = Vocab(word_counter)
@@ -286,15 +294,17 @@ def main():
             test_loader = pl.MpDeviceLoader(test_loader, device)
         
         models_to_test = {
-            "Zarvan": ZarvanIMDBClassifier(len(vocab), seq_len, FLAGS['embed_dim'], FLAGS['hidden_dim'], 2, FLAGS['num_heads'], vocab.stoi['<pad>']),
-            "Transformer": TransformerIMDBClassifier(len(vocab), seq_len, FLAGS['embed_dim'], FLAGS['ff_dim'], 2, FLAGS['num_heads'], vocab.stoi['<pad>'])
+            "Zarvan": ZarvanIMDBClassifier(len(vocab), seq_len, FLAGS['embed_dim'], FLAGS['hidden_dim'], 2, FLAGS['num_heads'], FLAGS['num_layers'], vocab.stoi['<pad>']),
+            "Transformer": TransformerIMDBClassifier(len(vocab), seq_len, FLAGS['embed_dim'], FLAGS['ff_dim'], 2, FLAGS['num_heads'], FLAGS['num_layers'], vocab.stoi['<pad>'])
         }
 
         for name, model in models_to_test.items():
             model.to(device)
             optimizer = optim.AdamW(model.parameters(), lr=FLAGS['learning_rate'], weight_decay=FLAGS['weight_decay'])
             
-            if rank == 0: print(f"\n🚀 Training {name}...")
+            if rank == 0:
+                param_count = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+                print(f"\n🚀 Training {name} ({param_count:.2f}M params)...")
             start_time = time.time()
             
             for epoch in range(1, FLAGS['num_epochs'] + 1):
