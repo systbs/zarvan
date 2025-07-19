@@ -107,7 +107,8 @@ class ZarvanBlock(nn.Module):
         forget_gate = torch.sigmoid(forget_gate)
         
         gated_x = input_gate * x + forget_gate * self.gated_proj(x) 
-        output = self.ffn(gated_x)
+        ffn_input = gated_x + i_ctx_exp + q_exp
+        output = self.ffn(ffn_input)
         return self.norm(x + output)
 
 class ZarvanMNISTClassifier(nn.Module):
