@@ -1,0 +1,32 @@
+# ===================================================================
+# Dependencies for the Zarvan Project
+# ===================================================================
+#
+# Use this file to install all necessary packages to run the
+# experiments and use the model.
+#
+# Installation:
+# pip install -r requirements.txt
+#
+
+# --- Core Machine Learning Library ---
+# PyTorch is the foundation for the entire project.
+torch
+torchvision
+# Note: The specific version of torch (CPU or CUDA) should be installed
+# according to your hardware. See https://pytorch.org/get-started/locally/
+
+# --- Hugging Face Ecosystem ---
+# Used for loading datasets (e.g., IMDb, MS MARCO) and tokenizers.
+datasets
+transformers
+
+# --- Data Handling and Plotting ---
+# Used for organizing and displaying results from benchmarks.
+pandas
+matplotlib
+seaborn
+
+# --- Utilities ---
+# Used for creating progress bars in training loops.
+tqdm
