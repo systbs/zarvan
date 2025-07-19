@@ -1,3 +1,12 @@
+# ===================================================================
+#
+#   MNIST Benchmark: Definitive Zarvan vs. Transformer
+#
+# This script runs a benchmark comparing the final, hybrid Zarvan
+# architecture against a standard Transformer baseline on the
+# MNIST image classification task, treating images as sequences of pixels.
+#
+# ===================================================================
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,12 +16,12 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import time
 import math
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import os
 
 # --- 1. Environment Detection and Universal Setup ---
 try:
-    # Attempt to import PyTorch/XLA libraries
+    # Attempt to import PyTorch/XLA libraries for TPU support
     import torch_xla
     import torch_xla.core.xla_model as xm
     import torch_xla.distributed.xla_multiprocessing as xmp
@@ -28,18 +37,21 @@ FLAGS = {
     "seq_len": 28 * 28,
     "embed_dim": 128,
     "hidden_dim": 256,
-    "ff_dim": 512,
-    "total_batch_size": 128, # Increased for better GPU utilization
+    "ff_dim": 512, # Feed-forward dim for Transformer
+    "total_batch_size": 128,
     "num_epochs": 10,
     "learning_rate": 1e-3,
     "weight_decay": 1e-2,
     "num_heads": 4,
-    "num_workers": 2,
+    "num_layers": 2, # Number of layers for both models
+    "num_workers": 0, # Set to 0 to avoid multiprocessing issues
 }
 
-# --- 3. Refactored Zarvan Model Architecture (B, S, E) ---
+# ============================================================================
+# Part 3: Definitive Zarvan Architecture
+# ============================================================================
 
-class SinusoidalPositionalEncoding(nn.Module):
+class PositionalEncoding(nn.Module):
     def __init__(self, embed_dim: int, max_len: int = 2048):
         super().__init__()
         position = torch.arange(max_len).unsqueeze(1)
@@ -52,7 +64,7 @@ class SinusoidalPositionalEncoding(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.pe[:, :x.size(1), :]
 
-class LinearQueryExtractor(nn.Module):
+class HolisticContextExtractor(nn.Module):
     def __init__(self, embed_dim: int, num_heads: int):
         super().__init__()
         self.embed_dim, self.num_heads = embed_dim, num_heads
@@ -71,71 +83,77 @@ class LinearQueryExtractor(nn.Module):
         concatenated_heads = head_outputs.reshape(B, self.embed_dim)
         return self.combine(concatenated_heads)
 
+class AssociativeContextExtractor(nn.Module):
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        self.importance_scorer = nn.Sequential(nn.Linear(embed_dim, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        scores = self.importance_scorer(x)
+        weights = F.softmax(scores, dim=1)
+        context = torch.sum(weights * x, dim=1)
+        return context
+
 class ZarvanBlock(nn.Module):
     def __init__(self, embed_dim: int, hidden_dim: int, num_heads: int):
         super().__init__()
-        self.query_extractor = LinearQueryExtractor(embed_dim, num_heads)
-        self.interactive_context = nn.Linear(embed_dim, embed_dim)
+        self.holistic_ctx = HolisticContextExtractor(embed_dim, num_heads)
+        self.associative_ctx = AssociativeContextExtractor(embed_dim)
         self.gate_net = nn.Sequential(
-            nn.Linear(embed_dim * 3, hidden_dim), 
+            nn.Linear(embed_dim * 3, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, embed_dim * 2) # Outputs 2 gates
+            nn.Linear(hidden_dim, embed_dim * 2)
         )
+        self.update_proj = nn.Linear(embed_dim, embed_dim)
         self.norm = nn.LayerNorm(embed_dim)
-        self.ffn = nn.Sequential( # Feed-forward network after gating
+        self.ffn = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, embed_dim)
         )
-        self.gated_proj = nn.Linear(embed_dim, embed_dim)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, S, E = x.shape
-        q = self.query_extractor(x)
-        i_ctx = F.gelu(self.interactive_context(q))
-        q_exp = q.unsqueeze(1).expand(-1, S, -1)
-        i_ctx_exp = i_ctx.unsqueeze(1).expand(-1, S, -1)
-        gate_input = torch.cat([x, q_exp, i_ctx_exp], dim=-1)
-        
-        gates = self.gate_net(gate_input)
-        input_gate, forget_gate = gates.chunk(2, dim=-1)
-        
-        input_gate = torch.sigmoid(input_gate)
-        forget_gate = torch.sigmoid(forget_gate)
-        
-        gated_x = input_gate * x + forget_gate * self.gated_proj(x) 
-        ffn_input = gated_x + i_ctx_exp + q_exp
-        output = self.ffn(ffn_input)
+        q_holistic = self.holistic_ctx(x)
+        q_associative = self.associative_ctx(x)
+        q_holistic_exp = q_holistic.unsqueeze(1).expand(-1, S, -1)
+        q_associative_exp = q_associative.unsqueeze(1).expand(-1, S, -1)
+        gate_input = torch.cat([x, q_holistic_exp, q_associative_exp], dim=-1)
+        input_gate, forget_gate = self.gate_net(gate_input).chunk(2, dim=-1)
+        gated_x = torch.sigmoid(input_gate) * x + torch.sigmoid(forget_gate) * self.update_proj(x)
+        output = self.ffn(gated_x)
         return self.norm(x + output)
 
+# --- 4. Classifier Models for MNIST ---
 class ZarvanMNISTClassifier(nn.Module):
-    def __init__(self, seq_len, embed_dim, hidden_dim, num_classes, num_heads):
+    def __init__(self, seq_len, embed_dim, hidden_dim, num_classes, num_heads, num_layers):
         super().__init__()
-        self.pixel_embedding = nn.Linear(1, embed_dim)
-        self.pos_encoder = SinusoidalPositionalEncoding(embed_dim, max_len=seq_len)
-        self.zarvan_block = ZarvanBlock(embed_dim, hidden_dim, num_heads)
+        self.pixel_embedding = nn.Linear(1, embed_dim) # Embed each pixel's intensity
+        self.pos_encoder = PositionalEncoding(embed_dim, max_len=seq_len)
+        self.layers = nn.ModuleList([
+            ZarvanBlock(embed_dim, hidden_dim, num_heads) for _ in range(num_layers)
+        ])
         self.fc = nn.Linear(embed_dim, num_classes)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]
-        # Flatten image and add a channel dimension
-        x = x.view(B, -1, 1) 
+        x = x.view(B, -1, 1) # Flatten image into a sequence
         x = self.pixel_embedding(x)
         x = self.pos_encoder(x)
-        x = self.zarvan_block(x)
-        # Global average pooling
-        z = x.mean(dim=1) 
+        for layer in self.layers:
+            x = layer(x)
+        z = x.mean(dim=1) # Global average pooling
         return self.fc(z)
 
 class TransformerMNISTClassifier(nn.Module):
-    def __init__(self, seq_len, embed_dim, ff_dim, num_classes, num_heads):
+    def __init__(self, seq_len, embed_dim, ff_dim, num_classes, num_heads, num_layers):
         super().__init__()
         self.pixel_embedding = nn.Linear(1, embed_dim)
-        self.pos_encoder = SinusoidalPositionalEncoding(embed_dim, max_len=seq_len)
+        self.pos_encoder = PositionalEncoding(embed_dim, max_len=seq_len)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim, nhead=num_heads, dim_feedforward=ff_dim,
             dropout=0.1, batch_first=True, activation='gelu')
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.fc = nn.Linear(embed_dim, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -147,8 +165,7 @@ class TransformerMNISTClassifier(nn.Module):
         z = x.mean(dim=1)
         return self.fc(z)
 
-# --- 4. Universal Training and Evaluation Functions ---
-
+# --- 5. Universal Training and Evaluation Functions ---
 def run_epoch(is_training, model, loader, optimizer, criterion, device):
     model.train(is_training)
     total_loss, total_correct, total_samples = 0, 0, 0
@@ -175,7 +192,6 @@ def run_epoch(is_training, model, loader, optimizer, criterion, device):
             total_correct += (output.argmax(1) == target).sum().item()
             total_samples += target.size(0)
 
-    # For TPU, aggregate results from all cores
     if IS_TPU and not is_training:
         total_correct = xm.mesh_reduce('val_correct', total_correct, sum)
         total_samples = xm.mesh_reduce('val_samples', total_samples, sum)
@@ -184,11 +200,8 @@ def run_epoch(is_training, model, loader, optimizer, criterion, device):
     accuracy = 100. * total_correct / total_samples
     return avg_loss, accuracy
 
-
-# --- 5. Main Execution Logic ---
-
+# --- 6. Main Execution Logic ---
 def main():
-    # --- Device and Batch Size Setup ---
     if IS_TPU:
         rank = xm.get_ordinal()
         device = xm.xla_device()
@@ -201,7 +214,6 @@ def main():
     if rank == 0:
         print(f"Running on Device: {str(device).upper()} | Total Batch Size: {FLAGS['total_batch_size']}")
 
-    # --- Data Loading ---
     if rank == 0 and not os.path.exists("./data/MNIST"):
         print("Downloading MNIST dataset...")
         datasets.MNIST("./data", train=True, download=True)
@@ -220,22 +232,21 @@ def main():
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, sampler=train_sampler,
-        shuffle=(train_sampler is None), num_workers=FLAGS['num_workers'], pin_memory=True)
+        shuffle=(train_sampler is None), num_workers=FLAGS['num_workers'], pin_memory=not IS_TPU)
     test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, num_workers=FLAGS['num_workers'], pin_memory=True)
+        test_dataset, batch_size=batch_size, shuffle=False, num_workers=FLAGS['num_workers'], pin_memory=not IS_TPU)
 
     if IS_TPU:
         train_loader = pl.MpDeviceLoader(train_loader, device)
         test_loader = pl.MpDeviceLoader(test_loader, device)
         
-    # --- Model Training Loop ---
     models_to_test = {
         "Zarvan": ZarvanMNISTClassifier(
             seq_len=FLAGS['seq_len'], embed_dim=FLAGS['embed_dim'], hidden_dim=FLAGS['hidden_dim'],
-            num_classes=10, num_heads=FLAGS['num_heads']),
+            num_classes=10, num_heads=FLAGS['num_heads'], num_layers=FLAGS['num_layers']),
         "Transformer": TransformerMNISTClassifier(
             seq_len=FLAGS['seq_len'], embed_dim=FLAGS['embed_dim'], ff_dim=FLAGS['ff_dim'],
-            num_classes=10, num_heads=FLAGS['num_heads'])
+            num_classes=10, num_heads=FLAGS['num_heads'], num_layers=FLAGS['num_layers'])
     }
     
     criterion = nn.CrossEntropyLoss()
@@ -243,7 +254,6 @@ def main():
 
     for name, model in models_to_test.items():
         model.to(device)
-        
         optimizer = optim.AdamW(model.parameters(), lr=FLAGS['learning_rate'], weight_decay=FLAGS['weight_decay'])
         
         if rank == 0:
@@ -259,7 +269,6 @@ def main():
                 history[name]['test_acc'].append(test_acc)
                 print(f"Epoch {epoch}/{FLAGS['num_epochs']} -> Train Acc: {train_acc:.2f}% | Test Acc: {test_acc:.2f}%")
                 
-    # --- Plotting ---
     if rank == 0:
         plt.style.use('seaborn-v0_8-whitegrid')
         plt.figure(figsize=(12, 8))
@@ -279,7 +288,6 @@ def main():
 # --- Universal Entry Point ---
 if __name__ == '__main__':
     if IS_TPU:
-        # On Kaggle/Colab, nprocs should be None or 8
         def _mp_fn_wrapper(rank, flags):
             main()
         xmp.spawn(_mp_fn_wrapper, args=(FLAGS,), nprocs=None, start_method='fork')
