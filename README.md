@@ -1,85 +1,106 @@
-# Zarvan: A Linear-Complexity Sequence Model
-Zarvan is an innovative PyTorch-based sequence modeling architecture designed for high performance and efficiency, particularly for tasks involving long sequences where traditional quadratic-complexity attention mechanisms (like those in standard Transformers) become computationally expensive. Zarvan achieves competitive results on various sequence-based tasks, including vision and language, by employing a novel linear-complexity selective copy mechanism.
+
+# Zarvan: An Efficient Gated Architecture for Sequence Modeling
+
+ Zarvan is a novel sequence modeling architecture implemented in PyTorch, designed as a high-performance, linearly scalable alternative to the standard Transformer. It addresses the quadratic complexity bottleneck of self-attention by replacing it with a unique dual-context gating mechanism, enabling efficient processing of extremely long sequences without sacrificing performance.
+
+The experimental results demonstrate that Zarvan achieves accuracy competitive with the Transformer across a diverse range of benchmarks while being significantly more efficient.
+
+Figure: Zarvan's linear time complexity (blue) vs. the Transformer's quadratic complexity (red) on the IMDb dataset. Zarvan achieves comparable accuracy with vastly superior scalability.
 
 ## Key Features
-Linear Complexity: Unlike standard Transformers, Zarvan's computational complexity scales linearly with sequence length, making it highly efficient for very long sequences.
+Linear Complexity (O(S)): Zarvan's computation and memory usage scale linearly with sequence length S, making it ideal for long-document analysis, high-resolution vision tasks, and time-series forecasting.
 
-Selective Copy Mechanism: The core ZarvanBlock incorporates a gating mechanism that allows the model to dynamically "copy" or "filter" information from the input sequence based on a global query and interactive context. This enables efficient information flow without explicit element-wise attention.
+Dual-Context Gating: Instead of self-attention, Zarvan uses two global context vectors—a Holistic Context for the overall "gist" and an Associative Context for focused memory—to intelligently modulate information flow for each token.
 
-Modular Design: The architecture is broken down into reusable and understandable modules (SinusoidalPositionalEncoding, LinearQueryExtractor, ZarvanBlock).
+High Performance: Achieves accuracy competitive with, and in some cases superior to, the standard Transformer on benchmarks like IMDb, MS MARCO, MNIST, and long-range synthetic tasks.
 
-PyTorch Implementation: Fully implemented in PyTorch, leveraging its flexibility and performance.
+Versatile & Flexible: Proven to be effective across different domains, including NLP, information retrieval, and vision.
 
-Versatile: Designed to be applicable across various sequence modeling tasks, including classification, retrieval, and potentially generation.
+PyTorch-based: A clean, modular, and easy-to-understand implementation in modern PyTorch.
 
-## Architecture Overview
-The Zarvan architecture consists of the following main components:
+## Architecture Deep Dive
+The core of the model is the Zarvan Block. This block processes an input sequence by first computing two parallel global context vectors and then using them to inform a gated update for each token.
 
-SinusoidalPositionalEncoding: Adds positional information to input embeddings, allowing the model to account for the order of elements in a sequence. This is a standard component inspired by the original Transformer.
+Figure: The data flow within a single Zarvan Block.
 
-LinearQueryExtractor: An efficient module that processes the entire input sequence to generate a single "global query" vector. This query summarizes the sequence's content and is used to guide the selective copy mechanism in the ZarvanBlock. It operates with linear complexity.
+Holistic Context Extractor: Captures a comprehensive summary of the entire sequence into a single vector.
 
-ZarvanBlock: The core processing unit. It takes the sequence and the global query, and through a gating network (comprising input_gate and forget_gate), it selectively updates each token's representation. This mechanism allows for efficient information propagation and filtering.
+Associative Context Extractor: Learns to assign importance scores to each token, creating a weighted average that focuses on the most salient information. This is crucial for long-range memory tasks.
 
-ZarvanForClassification: A higher-level model that wraps the core Zarvan components for classification tasks. It includes an embedding layer, positional encoding, a Zarvan block, and a final classification head (linear layer).
+Gated Update Mechanism: The two context vectors are used to parameterize an input gate and a forget gate for each token, allowing the model to dynamically filter and update its representation based on a global understanding of the sequence.
 
-## Installation
-This project requires PyTorch. You can install it via pip:
+## Results & Benchmarks
+Zarvan has been rigorously tested against a standard Transformer baseline on five distinct tasks. A summary of the results is below. For a full analysis, please see our paper.
+
+Benchmark	Task Domain	Zarvan Performance	Key Takeaway
+IMDb	NLP Classification	Comparable Accuracy, ~41% Faster (at S=512)	Demonstrates superior scalability.
+MNIST	Vision as Sequence	Statistically Comparable Accuracy	Proves versatility across modalities.
+MS MARCO	Information Retrieval	Statistically Comparable Accuracy, Faster	Effective for semantic embedding tasks.
+Selective Copy	Synthetic Memory	100% Accuracy	Perfect long-range, precise memory recall.
+Adding Problem	Synthetic Reasoning	~99% Accuracy	Capable of basic computation on stored memory.
+
+
+Installation
+Clone the repository:
 
 ```Bash
 
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 # For CUDA 11.8
-# Or for CPU only:
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-No other specific libraries are strictly required for the zarvan_model.py file itself, but training scripts might depend on tqdm, datasets, transformers, etc.
+git clone https://github.com/systbs/zarvan.git
+cd zarvan
 ```
-Usage
-To use the Zarvan model in your project, you can import the classes from zarvan_model.py.
+Install the required dependencies. It is recommended to use a virtual environment. The experiments rely on libraries listed in requirements.txt.
 
-Example: Using ZarvanForClassification
-The if __name__ == '__main__': block in zarvan_model.py provides a runnable example of how to instantiate and use the ZarvanForClassification model.
+```Bash
+
+pip install -r requirements.txt
+```
+This will install PyTorch, datasets, transformers, and other necessary packages.
+
+Quick Start
+You can easily import and use the ZarvanModel in your projects. The example below shows how to instantiate the model for a standard sequence classification task.
 
 ```Python
 
-# In your Python script (e.g., my_training_script.py)
-from zarvan_model import ZarvanForClassification
 import torch
+from zarvan import ZarvanModel # Assuming the code is in a package or zarvan.py
 
-# Define model parameters
-BATCH_SIZE = 4
-SEQ_LEN = 512
+# --- Model Configuration ---
 VOCAB_SIZE = 10000
+NUM_CLASSES = 10
+SEQ_LEN = 512
 EMBED_DIM = 128
 HIDDEN_DIM = 256
 NUM_HEADS = 4
-NUM_CLASSES = 5
+NUM_LAYERS = 4
+BATCH_SIZE = 16
 
-# Initialize the model
-model = ZarvanForClassification(
+# --- Instantiation ---
+print("Instantiating the ZarvanModel...")
+model = ZarvanModel(
     vocab_size=VOCAB_SIZE,
     num_classes=NUM_CLASSES,
     seq_len=SEQ_LEN,
     embed_dim=EMBED_DIM,
     hidden_dim=HIDDEN_DIM,
-    num_heads=NUM_HEADS
+    num_heads=NUM_HEADS,
+    num_layers=NUM_LAYERS
 )
 
-# Create dummy input (e.g., token IDs for a sequence)
+# --- Dummy Data and Forward Pass ---
+print("Performing a dummy forward pass...")
 dummy_input = torch.randint(low=1, high=VOCAB_SIZE, size=(BATCH_SIZE, SEQ_LEN))
+output_logits = model(dummy_input, pool='mean') # Use 'mean' pooling for classification
 
-# Perform a forward pass
-output_logits = model(dummy_input)
-
-print(f"Output logits shape: {output_logits.shape}") # Expected: (BATCH_SIZE, NUM_CLASSES)
+print(f"Input shape:  {dummy_input.shape}")
+print(f"Output shape: {output_logits.shape}") # Expected: (BATCH_SIZE, NUM_CLASSES)
+print("\n✅ Zarvan model is ready for use!")
 ```
-You can run the example directly from the command line:
 
-```Bash
-
-python zarvan_model.py
-```
 ## Contributing
-Contributions are welcome! If you find any issues or have suggestions for improvements, please open an issue or submit a pull request.
+Contributions, issues, and feature requests are welcome! Feel free to check the issues page.
+
+## Acknowledgements
+This work was developed by Yasser Sajjadi in collaboration with the AI assistants Gemini from Google and Grok from xAI. Their assistance was instrumental in architectural design, debugging, and analysis.
 
 ## License
-[MIT License]
+This project is licensed under the MIT License. See the LICENSE file for details.
