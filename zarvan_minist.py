@@ -29,16 +29,15 @@ FLAGS = {
     "embed_dim": 128,
     "hidden_dim": 256,
     "ff_dim": 512,
-    "total_batch_size": 64, # Total batch size for CPU/GPU, will be divided for TPU
+    "total_batch_size": 128, # Increased for better GPU utilization
     "num_epochs": 10,
-    "learning_rate": 1e-3, # A slightly higher LR often works well with large batches
+    "learning_rate": 1e-3,
     "weight_decay": 1e-2,
     "num_heads": 4,
     "num_workers": 2,
 }
 
 # --- 3. Refactored Zarvan Model Architecture (B, S, E) ---
-# (این بخش بدون تغییر باقی می‌ماند چون معماری مدل به سخت‌افزار وابسته نیست)
 
 class SinusoidalPositionalEncoding(nn.Module):
     def __init__(self, embed_dim: int, max_len: int = 2048):
@@ -96,12 +95,10 @@ class ZarvanBlock(nn.Module):
         i_ctx = F.gelu(self.interactive_context(q))
         q_exp = q.unsqueeze(1).expand(-1, S, -1)
         i_ctx_exp = i_ctx.unsqueeze(1).expand(-1, S, -1)
-        # Concatenate original input, query, and interactive context for gate calculation
         gate_input = torch.cat([x, q_exp, i_ctx_exp], dim=-1)
         
-        # Calculate gate values
         gates = self.gate_net(gate_input)
-        input_gate, forget_gate = gates.chunk(2, dim=-1) # Split into two gates
+        input_gate, forget_gate = gates.chunk(2, dim=-1)
         
         input_gate = torch.sigmoid(input_gate)
         forget_gate = torch.sigmoid(forget_gate)
@@ -121,11 +118,13 @@ class ZarvanMNISTClassifier(nn.Module):
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]
-        x = x.view(B, -1, 1)
+        # Flatten image and add a channel dimension
+        x = x.view(B, -1, 1) 
         x = self.pixel_embedding(x)
         x = self.pos_encoder(x)
         x = self.zarvan_block(x)
-        z = x.mean(dim=1)
+        # Global average pooling
+        z = x.mean(dim=1) 
         return self.fc(z)
 
 class TransformerMNISTClassifier(nn.Module):
@@ -154,26 +153,25 @@ def run_epoch(is_training, model, loader, optimizer, criterion, device):
     model.train(is_training)
     total_loss, total_correct, total_samples = 0, 0, 0
     
-    # Use tqdm for progress bar
     progress_bar = tqdm(loader, desc="Training" if is_training else "Evaluating", leave=False)
     
     with torch.set_grad_enabled(is_training):
         for data, target in progress_bar:
-            # For CPU/GPU, data/target are already on the correct device
-            # For TPU, the MpDeviceLoader handles moving data to the core's device
+            # ✅ FIX: Move data and targets to the correct device
+            data, target = data.to(device), target.to(device)
+            
             output = model(data)
             loss = criterion(output, target)
             
             if is_training:
                 optimizer.zero_grad()
                 loss.backward()
-                # Conditional optimizer step
                 if IS_TPU:
                     xm.optimizer_step(optimizer)
                 else:
                     optimizer.step()
 
-            total_loss += loss.item()
+            total_loss += loss.item() * data.size(0)
             total_correct += (output.argmax(1) == target).sum().item()
             total_samples += target.size(0)
 
@@ -182,7 +180,7 @@ def run_epoch(is_training, model, loader, optimizer, criterion, device):
         total_correct = xm.mesh_reduce('val_correct', total_correct, sum)
         total_samples = xm.mesh_reduce('val_samples', total_samples, sum)
 
-    avg_loss = total_loss / len(loader)
+    avg_loss = total_loss / total_samples
     accuracy = 100. * total_correct / total_samples
     return avg_loss, accuracy
 
@@ -192,25 +190,22 @@ def run_epoch(is_training, model, loader, optimizer, criterion, device):
 def main():
     # --- Device and Batch Size Setup ---
     if IS_TPU:
-        # For TPU, this main function will be spawned for each core
-        # The rank is the index of the current process (0-7)
         rank = xm.get_ordinal()
         device = xm.xla_device()
-        # Divide batch size by number of cores
         batch_size = FLAGS['total_batch_size'] // xm.xrt_world_size()
     else:
-        rank = 0 # Single process
+        rank = 0
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         batch_size = FLAGS['total_batch_size']
     
-    print(f"Process {rank} | Device: {device} | Per-Device Batch Size: {batch_size}")
+    if rank == 0:
+        print(f"Running on Device: {str(device).upper()} | Total Batch Size: {FLAGS['total_batch_size']}")
 
     # --- Data Loading ---
-    # Download data only on the master process to avoid race conditions
-    if rank == 0:
+    if rank == 0 and not os.path.exists("./data/MNIST"):
+        print("Downloading MNIST dataset...")
         datasets.MNIST("./data", train=True, download=True)
     
-    # Barrier to ensure data is downloaded before all processes continue
     if IS_TPU:
         xm.rendezvous('download_complete')
 
@@ -218,7 +213,6 @@ def main():
     train_dataset = datasets.MNIST("./data", train=True, transform=transform)
     test_dataset = datasets.MNIST("./data", train=False, transform=transform)
 
-    # Create sampler for distributed training if on TPU
     train_sampler = None
     if IS_TPU:
         train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -226,11 +220,10 @@ def main():
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, sampler=train_sampler,
-        shuffle=(train_sampler is None), num_workers=FLAGS['num_workers'])
+        shuffle=(train_sampler is None), num_workers=FLAGS['num_workers'], pin_memory=True)
     test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, num_workers=FLAGS['num_workers'])
+        test_dataset, batch_size=batch_size, shuffle=False, num_workers=FLAGS['num_workers'], pin_memory=True)
 
-    # For TPU, wrap the loaders
     if IS_TPU:
         train_loader = pl.MpDeviceLoader(train_loader, device)
         test_loader = pl.MpDeviceLoader(test_loader, device)
@@ -254,13 +247,13 @@ def main():
         optimizer = optim.AdamW(model.parameters(), lr=FLAGS['learning_rate'], weight_decay=FLAGS['weight_decay'])
         
         if rank == 0:
-            print(f"\n🚀 Training {name} on MNIST...")
+            param_count = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+            print(f"\n🚀 Training {name} ({param_count:.2f}M params) on MNIST...")
             
         for epoch in range(1, FLAGS['num_epochs'] + 1):
             train_loss, train_acc = run_epoch(True, model, train_loader, optimizer, criterion, device)
             test_loss, test_acc = run_epoch(False, model, test_loader, None, criterion, device)
             
-            # Logging and history saving should only happen on one process
             if rank == 0:
                 history[name]['train_acc'].append(train_acc)
                 history[name]['test_acc'].append(test_acc)
@@ -268,26 +261,27 @@ def main():
                 
     # --- Plotting ---
     if rank == 0:
+        plt.style.use('seaborn-v0_8-whitegrid')
         plt.figure(figsize=(12, 8))
         plt.title(f'Zarvan vs. Transformer on MNIST ({str(device).upper()})', fontsize=16)
         epochs_range = range(1, FLAGS['num_epochs'] + 1)
         for name, hist in history.items():
             plt.plot(epochs_range, hist['train_acc'], marker='o', linestyle='-', label=f'{name} Train Acc')
             plt.plot(epochs_range, hist['test_acc'], marker='s', linestyle='--', label=f'{name} Test Acc')
-        plt.xlabel('Epochs')
-        plt.ylabel('Accuracy (%)')
-        plt.legend()
-        plt.grid(True)
+        plt.xlabel('Epochs', fontsize=12)
+        plt.ylabel('Accuracy (%)', fontsize=12)
+        plt.legend(fontsize=12)
+        plt.xticks(epochs_range)
+        plt.tight_layout()
         plt.savefig("mnist_universal_results.png")
         print("\nSaved final plot to 'mnist_universal_results.png'")
 
 # --- Universal Entry Point ---
 if __name__ == '__main__':
     if IS_TPU:
-        # Start XLA Multiprocessing for TPU
+        # On Kaggle/Colab, nprocs should be None or 8
         def _mp_fn_wrapper(rank, flags):
             main()
-        xmp.spawn(_mp_fn_wrapper, args=(FLAGS,), nprocs=1, start_method='fork')
+        xmp.spawn(_mp_fn_wrapper, args=(FLAGS,), nprocs=None, start_method='fork')
     else:
-        # Run standard main function for CPU/GPU
         main()
