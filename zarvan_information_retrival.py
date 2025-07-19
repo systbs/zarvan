@@ -140,7 +140,8 @@ class GatedZarvanBlock(nn.Module): # Renamed to reflect gating mechanism
         gated_x = input_gate * x + forget_gate * self.gated_proj(x) # Simplified update
         
         # Apply a feed-forward network to the gated output
-        output = self.ffn(gated_x)
+        ffn_input = gated_x + i_ctx_exp + q_exp
+        output = self.ffn(ffn_input)
         
         # Residual connection and layer normalization
         return self.norm(x + output)
