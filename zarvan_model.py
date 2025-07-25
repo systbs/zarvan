@@ -11,7 +11,7 @@
 # to be both powerful and computationally frugal.
 #
 # Author: Yasser Sajjadi, in collaboration with Google's Gemini
-# GitHub: https://github.com/systbs/zarvan (Replace with your actual repo link)
+# GitHub: https://github.com/systbs/zarvan 
 #
 # ============================================================================
 
