@@ -1,0 +1,584 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import math
+import random
+import time
+from tqdm.auto import tqdm
+import copy 
+import matplotlib.pyplot as plt # Import for plotting
+import numpy as np # Import for numerical operations like linspace
+
+
+# --- 1. Configuration ---
+FLAGS = {
+    "seq_len": 256,
+    "vocab_size": 20, # 0=PAD, 1=NOISE, 2=GO, 3=COPY, 4..19=regular values
+    "embed_dim": 128,
+    "hidden_dim": 256,
+    "ff_dim": 256, # Feed-forward dim for Transformer
+    "batch_size": 64,
+    "num_epochs": 10, # Increased epochs for clearer convergence curves
+    "learning_rate": 1e-4,
+    "num_heads": 4,
+    "num_layers": 2, # Starting with 2 layers, can increase
+    "train_samples": 10000,
+    "val_samples": 1000 # Added validation set size
+}
+
+# ============================================================================
+# Part 2: Core Context Kernels (Definitive Version - Modified for Ablation in ZarvanBlock)
+# ============================================================================
+
+class PositionalEncoding(nn.Module):
+    """
+    Injects sinusoidal positional information into the input sequence.
+    """
+    def __init__(self, embed_dim: int, max_len: int = 2048):
+        super().__init__()
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, embed_dim, 2) * (-math.log(10000.0) / embed_dim))
+        pe = torch.zeros(max_len, embed_dim)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pe[:, :x.size(1), :]
+
+class HolisticContextExtractor(nn.Module):
+    """
+    Extracts a holistic context vector from the entire sequence.
+    """
+    def __init__(self, embed_dim: int, num_heads: int):
+        super().__init__()
+        self.embed_dim, self.num_heads = embed_dim, num_heads
+        self.head_dim = embed_dim // num_heads
+        self.s_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.combine = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, S, _ = x.shape
+        s, v = self.s_proj(x), self.v_proj(x)
+        s = s.view(B, S, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v.view(B, S, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        weights = F.softmax(s, dim=-1)
+        head_outputs = (weights * v).sum(dim=2)
+        concatenated_heads = head_outputs.reshape(B, self.embed_dim)
+        return self.combine(concatenated_heads)
+
+class AssociativeContextExtractor(nn.Module):
+    """
+    Extracts an associative context vector by learning importance scores.
+    """
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        self.importance_scorer = nn.Sequential(nn.Linear(embed_dim, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        scores = self.importance_scorer(x)
+        weights = F.softmax(scores, dim=1)
+        context = torch.sum(weights * x, dim=1)
+        return context
+
+class ZarvanBlock(nn.Module):
+    """
+    The definitive, hybrid Zarvan Block. Modified to allow ablation.
+    """
+    def __init__(self, embed_dim: int, hidden_dim: int, num_heads: int,
+                 use_holistic: bool = True, use_associative: bool = True,
+                 use_gating: bool = True):
+        super().__init__()
+        self.use_holistic = use_holistic
+        self.use_associative = use_associative
+        self.use_gating = use_gating
+
+        # --- Dual Context Kernels ---
+        if self.use_holistic:
+            self.holistic_ctx = HolisticContextExtractor(embed_dim, num_heads)
+        if self.use_associative:
+            self.associative_ctx = AssociativeContextExtractor(embed_dim)
+        
+        # Determine input dimension for gate_net/simple_combiner
+        gate_input_dim = embed_dim # For x
+        if self.use_holistic:
+            gate_input_dim += embed_dim
+        if self.use_associative:
+            gate_input_dim += embed_dim
+
+        # --- Gating Mechanism or Simple Combiner ---
+        if self.use_gating:
+            self.gate_net = nn.Sequential(
+                nn.Linear(gate_input_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, embed_dim * 2)
+            )
+            self.update_proj = nn.Linear(embed_dim, embed_dim)
+        else:
+            self.simple_combiner = nn.Linear(gate_input_dim, embed_dim) # Used when gating is off
+        
+        # --- Final Processing ---
+        self.norm = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, embed_dim)
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, S, E = x.shape
+        
+        # 1. Extract dual context vectors in parallel (or skip if ablated)
+        q_holistic_exp = torch.zeros(B, S, E, device=x.device)
+        q_associative_exp = torch.zeros(B, S, E, device=x.device)
+
+        if self.use_holistic:
+            q_holistic = self.holistic_ctx(x)
+            q_holistic_exp = q_holistic.unsqueeze(1).expand(-1, S, -1)
+        
+        if self.use_associative:
+            q_associative = self.associative_ctx(x)
+            q_associative_exp = q_associative.unsqueeze(1).expand(-1, S, -1)
+        
+        # 2. Prepare the input for the gate mechanism
+        gate_input_components = [x]
+        if self.use_holistic:
+            gate_input_components.append(q_holistic_exp)
+        if self.use_associative:
+            gate_input_components.append(q_associative_exp)
+            
+        gate_input = torch.cat(gate_input_components, dim=-1)
+        
+        # 3. Compute gates and apply the update mechanism (or simplify if ablated)
+        if self.use_gating:
+            input_gate, forget_gate = self.gate_net(gate_input).chunk(2, dim=-1)
+            gated_x = torch.sigmoid(input_gate) * x + torch.sigmoid(forget_gate) * self.update_proj(x)
+        else:
+            gated_x = self.simple_combiner(gate_input)
+            
+        # 4. Final processing and residual connection
+        output = self.ffn(gated_x)
+        return self.norm(x + output)
+
+# ============================================================================
+# Part 3: The Complete Model for Sequence-to-Sequence Tasks (Zarvan & Transformer)
+# ============================================================================
+
+class ZarvanForSequenceModeling(nn.Module):
+    """
+    Complete Zarvan model optimized for sequence modeling tasks like selective copy.
+    Includes ablation options.
+    """
+    def __init__(self, vocab_size, seq_len, embed_dim, hidden_dim, num_heads, num_layers, padding_idx=0,
+                 use_holistic: bool = True, use_associative: bool = True, use_gating: bool = True):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=padding_idx)
+        self.pos_encoder = PositionalEncoding(embed_dim, max_len=seq_len)
+        self.layers = nn.ModuleList([
+            ZarvanBlock(embed_dim, hidden_dim, num_heads,
+                        use_holistic=use_holistic, use_associative=use_associative, use_gating=use_gating)
+            for _ in range(num_layers)
+        ])
+        self.lm_head = nn.Linear(embed_dim, vocab_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.embedding(x)
+        x = self.pos_encoder(x)
+        for layer in self.layers:
+            x = layer(x)
+        logits = self.lm_head(x)
+        return logits
+
+class TransformerForSequenceModeling(nn.Module):
+    """
+    Standard Transformer Encoder model for sequence modeling tasks.
+    """
+    def __init__(self, vocab_size, seq_len, embed_dim, ff_dim, num_heads, num_layers, padding_idx=0, dropout=0.1):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=padding_idx)
+        self.pos_encoder = PositionalEncoding(embed_dim, max_len=seq_len)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=num_heads, dim_feedforward=ff_dim,
+            dropout=dropout, batch_first=True, activation='gelu')
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.lm_head = nn.Linear(embed_dim, vocab_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.embedding(x)
+        x = self.pos_encoder(x)
+        x = self.transformer(x)
+        logits = self.lm_head(x)
+        return logits
+
+# ============================================================================
+# Part 4: Selective Copy Dataset and Experiment Runner
+# ============================================================================
+
+class SelectiveCopyDataset(Dataset):
+    def __init__(self, vocab_size: int, seq_len: int, num_samples: int = 10000):
+        self.vocab_size, self.seq_len, self.num_samples = vocab_size, seq_len, num_samples
+        # Token definitions: 0 (PAD), 1 (NOISE), 2 (GO), 3 (COPY)
+        self.PAD_TOKEN = 0
+        self.NOISE_TOKEN = 1
+        self.GO_TOKEN = 2
+        self.COPY_TOKEN = 3
+        # Regular values start from first_regular_token up to vocab_size - 1
+        self.first_regular_token = 4
+
+        # Ensure vocab_size is sufficient
+        assert vocab_size >= self.first_regular_token, "Vocab size too small for defined tokens."
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        input_seq = torch.full((self.seq_len,), self.NOISE_TOKEN, dtype=torch.long)
+        # Target sequence: -100 for positions to ignore, value_to_copy at COPY_TOKEN pos
+        target_seq = torch.full((self.seq_len,), -100, dtype=torch.long) 
+
+        value_to_copy = random.randint(self.first_regular_token, self.vocab_size - 1)
+        
+        # Position for GO_TOKEN (start of seq) and VALUE (immediately after GO)
+        # Randomly choose start position for GO_TOKEN in first 10% of sequence
+        go_pos = random.randint(0, self.seq_len // 10) 
+        
+        input_seq[go_pos] = self.GO_TOKEN
+        # Place the value to copy right after the GO_TOKEN
+        if go_pos + 1 < self.seq_len:
+            input_seq[go_pos + 1] = value_to_copy
+
+        # Position for COPY_TOKEN (end of seq)
+        # Randomly choose copy position in last 10% of sequence
+        copy_pos = random.randint(self.seq_len - (self.seq_len // 10), self.seq_len - 1)
+        input_seq[copy_pos] = self.COPY_TOKEN
+        
+        # The target for the COPY_TOKEN position is the value_to_copy
+        target_seq[copy_pos] = value_to_copy
+        
+        return input_seq, target_seq
+
+
+# --- 5. Training and Evaluation Helper ---
+def run_selective_copy_experiment(model_name: str, model: nn.Module, 
+                                  train_loader: DataLoader, val_loader: DataLoader,
+                                  device: torch.device, config: dict):
+    
+    model.to(device)
+    criterion = nn.CrossEntropyLoss(ignore_index=-100) # Ignore -100 (non-target positions)
+    optimizer = optim.AdamW(model.parameters(), lr=config['learning_rate'])
+
+    print(f"\n--- Training {model_name} ---")
+    
+    # Store metrics for plotting
+    train_losses_history = []
+    val_losses_history = []
+    val_accuracies_history = []
+
+    start_time = time.time()
+    best_accuracy = 0.0
+
+    for epoch in range(1, config['num_epochs'] + 1):
+        model.train()
+        total_train_loss = 0
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{config['num_epochs']} [Train]", leave=False)
+        
+        for inputs, targets in progress_bar:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs) # outputs: (B, S, V)
+            
+            # Reshape for CrossEntropyLoss: (N, C) and (N)
+            loss = criterion(outputs.view(-1, config['vocab_size']), targets.view(-1))
+            loss.backward()
+            optimizer.step()
+            total_train_loss += loss.item()
+            progress_bar.set_postfix(loss=total_train_loss / (progress_bar.n + 1)) # Update postfix
+
+        # Validation phase
+        model.eval()
+        total_correct, total_predictions = 0, 0
+        total_val_loss = 0
+        progress_bar_val = tqdm(val_loader, desc=f"Epoch {epoch}/{config['num_epochs']} [Val]", leave=False)
+
+        with torch.no_grad():
+            for inputs, targets in progress_bar_val:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                
+                loss_val = criterion(outputs.view(-1, config['vocab_size']), targets.view(-1))
+                total_val_loss += loss_val.item()
+
+                target_mask = targets != -100 # Only consider positions that are actual targets
+                if target_mask.sum() > 0:
+                    predicted_indices = outputs[target_mask].argmax(dim=-1)
+                    actual_values = targets[target_mask]
+                    total_correct += (predicted_indices == actual_values).sum().item()
+                    total_predictions += target_mask.sum().item()
+                
+        avg_train_loss = total_train_loss / len(train_loader)
+        avg_val_loss = total_val_loss / len(val_loader)
+        accuracy = (total_correct / total_predictions) * 100 if total_predictions > 0 else 0
+        
+        print(f"Epoch {epoch}/{config['num_epochs']} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Accuracy: {accuracy:.2f}%")
+        
+        # Store for plotting
+        train_losses_history.append(avg_train_loss)
+        val_losses_history.append(avg_val_loss)
+        val_accuracies_history.append(accuracy)
+
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+
+    total_time = time.time() - start_time
+    print(f"Finished Training {model_name}. Best Val Accuracy: {best_accuracy:.2f}%. Total Time: {total_time:.2f}s")
+    
+    return {
+        'best_accuracy': best_accuracy,
+        'train_losses': train_losses_history,
+        'val_losses': val_losses_history,
+        'val_accuracies': val_accuracies_history
+    }
+
+
+# --- 6. Ablation Study Runner for Selective Copy ---
+def run_ablation_study_selective_copy(config: dict, device: torch.device):
+    print("\n" + "="*50)
+    print("Starting Selective Copy Ablation Study")
+    print("="*50)
+
+    train_dataset = SelectiveCopyDataset(vocab_size=config['vocab_size'], seq_len=config['seq_len'], num_samples=config['train_samples'])
+    val_dataset = SelectiveCopyDataset(vocab_size=config['vocab_size'], seq_len=config['seq_len'], num_samples=config['val_samples'])
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=0)
+
+    ablation_results = {}
+    ablation_histories = {} # To store loss/accuracy histories for plotting
+
+    # 1. Full Zarvan (Baseline)
+    print("\n--- Running Full Zarvan (Baseline) ---")
+    full_zarvan = ZarvanForSequenceModeling(
+        vocab_size=config['vocab_size'], seq_len=config['seq_len'], embed_dim=config['embed_dim'],
+        hidden_dim=config['hidden_dim'], num_heads=config['num_heads'], num_layers=config['num_layers'],
+        padding_idx=train_dataset.PAD_TOKEN, use_holistic=True, use_associative=True, use_gating=True
+    )
+    result = run_selective_copy_experiment("Full Zarvan", full_zarvan, train_loader, val_loader, device, config)
+    ablation_results['Full Zarvan'] = result['best_accuracy']
+    ablation_histories['Full Zarvan'] = result
+
+    # 2. Zarvan without Holistic Context
+    print("\n--- Running Zarvan -No Holistic Context ---")
+    no_holistic_zarvan = ZarvanForSequenceModeling(
+        vocab_size=config['vocab_size'], seq_len=config['seq_len'], embed_dim=config['embed_dim'],
+        hidden_dim=config['hidden_dim'], num_heads=config['num_heads'], num_layers=config['num_layers'],
+        padding_idx=train_dataset.PAD_TOKEN, use_holistic=False, use_associative=True, use_gating=True
+    )
+    result = run_selective_copy_experiment("Zarvan -No Holistic", no_holistic_zarvan, train_loader, val_loader, device, config)
+    ablation_results['Zarvan -No Holistic'] = result['best_accuracy']
+    ablation_histories['Zarvan -No Holistic'] = result
+
+    # 3. Zarvan without Associative Context
+    print("\n--- Running Zarvan -No Associative Context ---")
+    no_associative_zarvan = ZarvanForSequenceModeling(
+        vocab_size=config['vocab_size'], seq_len=config['seq_len'], embed_dim=config['embed_dim'],
+        hidden_dim=config['hidden_dim'], num_heads=config['num_heads'], num_layers=config['num_layers'],
+        padding_idx=train_dataset.PAD_TOKEN, use_holistic=True, use_associative=False, use_gating=True
+    )
+    result = run_selective_copy_experiment("Zarvan -No Associative", no_associative_zarvan, train_loader, val_loader, device, config)
+    ablation_results['Zarvan -No Associative'] = result['best_accuracy']
+    ablation_histories['Zarvan -No Associative'] = result
+
+    # 4. Zarvan without Gating Mechanism
+    print("\n--- Running Zarvan -No Gating Mechanism ---")
+    no_gating_zarvan = ZarvanForSequenceModeling(
+        vocab_size=config['vocab_size'], seq_len=config['seq_len'], embed_dim=config['embed_dim'],
+        hidden_dim=config['hidden_dim'], num_heads=config['num_heads'], num_layers=config['num_layers'],
+        padding_idx=train_dataset.PAD_TOKEN, use_holistic=True, use_associative=True, use_gating=False
+    )
+    result = run_selective_copy_experiment("Zarvan -No Gating", no_gating_zarvan, train_loader, val_loader, device, config)
+    ablation_results['Zarvan -No Gating'] = result['best_accuracy']
+    ablation_histories['Zarvan -No Gating'] = result
+
+    # 5. Transformer Baseline
+    print("\n--- Running Transformer Baseline ---")
+    transformer_model = TransformerForSequenceModeling(
+        vocab_size=config['vocab_size'], seq_len=config['seq_len'], embed_dim=config['embed_dim'],
+        ff_dim=config['ff_dim'], num_heads=config['num_heads'], num_layers=config['num_layers'],
+        padding_idx=train_dataset.PAD_TOKEN
+    )
+    result = run_selective_copy_experiment("Transformer", transformer_model, train_loader, val_loader, device, config)
+    ablation_results['Transformer'] = result['best_accuracy']
+    ablation_histories['Transformer'] = result
+
+    print("\n" + "="*50)
+    print("Selective Copy Ablation Study Results:")
+    print("="*50)
+    for model_type, acc in ablation_results.items():
+        print(f"{model_type}: {acc:.2f}% Accuracy")
+    print("="*50)
+
+    # --- Plotting Ablation Study Trends ---
+    epochs_range = range(1, config['num_epochs'] + 1)
+
+    plt.figure(figsize=(12, 6))
+    for model_name, history in ablation_histories.items():
+        plt.plot(epochs_range, history['val_accuracies'], label=model_name)
+    plt.xlabel("Epoch")
+    plt.ylabel("Validation Accuracy (%)")
+    plt.title("Selective Copy Ablation Study: Validation Accuracy vs. Epoch")
+    plt.ylim(0, 105)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("ablation_study_accuracy_trend.png")
+    plt.close()
+
+    plt.figure(figsize=(12, 6))
+    for model_name, history in ablation_histories.items():
+        plt.plot(epochs_range, history['val_losses'], label=model_name)
+    plt.xlabel("Epoch")
+    plt.ylabel("Validation Loss")
+    plt.title("Selective Copy Ablation Study: Validation Loss vs. Epoch")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("ablation_study_loss_trend.png")
+    plt.close()
+
+    return ablation_results
+
+
+# --- 7. Hyperparameter Sensitivity Study Runner for Selective Copy ---
+def run_hyperparameter_sensitivity_study_selective_copy(config: dict, device: torch.device):
+    print("\n" + "="*50)
+    print("Starting Selective Copy Hyperparameter Sensitivity Study (Zarvan)")
+    print("="*50)
+
+    train_dataset = SelectiveCopyDataset(vocab_size=config['vocab_size'], seq_len=config['seq_len'], num_samples=config['train_samples'])
+    val_dataset = SelectiveCopyDataset(vocab_size=config['vocab_size'], seq_len=config['seq_len'], num_samples=config['val_samples'])
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=0)
+
+    sensitivity_results = {} # Final best accuracies
+    sensitivity_histories = {} # Training histories for plotting
+
+    # Parameters to vary and their values
+    embed_dims = [64, 128, 256]
+    num_heads_options = [2, 4, 8]
+    num_layers_options = [1, 2, 4]
+
+    # Sensitivity to embed_dim
+    print("\n--- Sensitivity to Embedding Dimension (embed_dim) ---")
+    sensitivity_histories['embed_dim'] = {}
+    for dim in embed_dims:
+        print(f"Testing with embed_dim = {dim}")
+        current_zarvan = ZarvanForSequenceModeling(
+            vocab_size=config['vocab_size'], seq_len=config['seq_len'], embed_dim=dim,
+            hidden_dim=config['hidden_dim'], num_heads=config['num_heads'], num_layers=config['num_layers'],
+            padding_idx=train_dataset.PAD_TOKEN
+        )
+        result = run_selective_copy_experiment(f"Zarvan (embed_dim={dim})", current_zarvan, train_loader, val_loader, device, config)
+        sensitivity_results[f"embed_dim={dim}"] = result['best_accuracy']
+        sensitivity_histories['embed_dim'][dim] = result
+
+    # Sensitivity to num_heads
+    print("\n--- Sensitivity to Number of Heads (num_heads) ---")
+    sensitivity_histories['num_heads'] = {}
+    for heads in num_heads_options:
+        print(f"Testing with num_heads = {heads}")
+        current_embed_dim = config['embed_dim'] # Use base embed_dim
+        if current_embed_dim % heads != 0:
+            current_embed_dim = heads * (current_embed_dim // heads + 1)
+            print(f"Adjusted embed_dim to {current_embed_dim} for num_heads={heads}")
+        
+        current_zarvan = ZarvanForSequenceModeling(
+            vocab_size=config['vocab_size'], seq_len=config['seq_len'], embed_dim=current_embed_dim,
+            hidden_dim=config['hidden_dim'], num_heads=heads, num_layers=config['num_layers'],
+            padding_idx=train_dataset.PAD_TOKEN
+        )
+        result = run_selective_copy_experiment(f"Zarvan (num_heads={heads})", current_zarvan, train_loader, val_loader, device, config)
+        sensitivity_results[f"num_heads={heads}"] = result['best_accuracy']
+        sensitivity_histories['num_heads'][heads] = result
+
+    # Sensitivity to num_layers
+    print("\n--- Sensitivity to Number of Layers (num_layers) ---")
+    sensitivity_histories['num_layers'] = {}
+    for layers in num_layers_options:
+        print(f"Testing with num_layers = {layers}")
+        current_zarvan = ZarvanForSequenceModeling(
+            vocab_size=config['vocab_size'], seq_len=config['seq_len'], embed_dim=config['embed_dim'],
+            hidden_dim=config['hidden_dim'], num_heads=config['num_heads'], num_layers=layers,
+            padding_idx=train_dataset.PAD_TOKEN
+        )
+        result = run_selective_copy_experiment(f"Zarvan (num_layers={layers})", current_zarvan, train_loader, val_loader, device, config)
+        sensitivity_results[f"num_layers={layers}"] = result['best_accuracy']
+        sensitivity_histories['num_layers'][layers] = result
+
+    print("\n" + "="*50)
+    print("Hyperparameter Sensitivity Study Results on Selective Copy (Zarvan):")
+    print("="*50)
+    for param_val, acc in sensitivity_results.items():
+        print(f"{param_val}: {acc:.2f}% Accuracy")
+    print("="*50)
+
+    # --- Plotting Sensitivity Study Trends ---
+    epochs_range = range(1, config['num_epochs'] + 1)
+
+    # Plot for embed_dim
+    plt.figure(figsize=(12, 6))
+    for dim, history in sensitivity_histories['embed_dim'].items():
+        plt.plot(epochs_range, history['val_accuracies'], label=f"embed_dim={dim}")
+    plt.xlabel("Epoch")
+    plt.ylabel("Validation Accuracy (%)")
+    plt.title("Zarvan Sensitivity: Validation Accuracy vs. Epoch (Embed Dim)")
+    plt.ylim(0, 105)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("sensitivity_embed_dim_trend.png")
+    plt.close()
+
+    # Plot for num_heads
+    plt.figure(figsize=(12, 6))
+    for heads, history in sensitivity_histories['num_heads'].items():
+        plt.plot(epochs_range, history['val_accuracies'], label=f"num_heads={heads}")
+    plt.xlabel("Epoch")
+    plt.ylabel("Validation Accuracy (%)")
+    plt.title("Zarvan Sensitivity: Validation Accuracy vs. Epoch (Num Heads)")
+    plt.ylim(0, 105)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("sensitivity_num_heads_trend.png")
+    plt.close()
+
+    # Plot for num_layers
+    plt.figure(figsize=(12, 6))
+    for layers, history in sensitivity_histories['num_layers'].items():
+        plt.plot(epochs_range, history['val_accuracies'], label=f"num_layers={layers}")
+    plt.xlabel("Epoch")
+    plt.ylabel("Validation Accuracy (%)")
+    plt.title("Zarvan Sensitivity: Validation Accuracy vs. Epoch (Num Layers)")
+    plt.ylim(0, 105)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("sensitivity_num_layers_trend.png")
+    plt.close()
+
+    return sensitivity_results
+
+
+# --- Main Execution Block ---
+if __name__ == '__main__':
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running on device: {device}")
+
+    # Run Ablation Study for Selective Copy
+    ablation_final_results = run_ablation_study_selective_copy(FLAGS, device)
+
+    # Run Hyperparameter Sensitivity Study for Selective Copy
+    sensitivity_flags = FLAGS.copy() # Make a copy of FLAGS to ensure base config remains consistent
+    sensitivity_final_results = run_hyperparameter_sensitivity_study_selective_copy(sensitivity_flags, device)
