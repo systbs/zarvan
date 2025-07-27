@@ -72,7 +72,7 @@ class HolisticContextExtractor(nn.Module):
         s = s.view(B, S, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         v = v.view(B, S, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         weights = F.softmax(s, dim=-1)
-        head_outputs = (weights * v).sum(dim=2)
+        head_outputs = torch.sum(weights * v, dim=2)
         concatenated_heads = head_outputs.reshape(B, self.embed_dim)
         return self.combine(concatenated_heads)
 
@@ -86,12 +86,13 @@ class AssociativeContextExtractor(nn.Module):
     """
     def __init__(self, embed_dim: int):
         super().__init__()
-        self.importance_scorer = nn.Sequential(nn.Linear(embed_dim, 1))
+        self.s_proj = nn.Linear(embed_dim, 1)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        scores = self.importance_scorer(x)
-        weights = F.softmax(scores, dim=1)
-        context = torch.sum(weights * x, dim=1)
+        s, v = self.s_proj(x), self.v_proj(x)
+        weights = F.softmax(s, dim=1)
+        context = torch.sum(weights * v, dim=1)
         return context
 
 # ============================================================================
@@ -275,4 +276,3 @@ if __name__ == '__main__':
 
     except Exception as e:
         print(f"\n❌ An error occurred during the forward pass: {e}")
-
