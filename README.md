@@ -95,6 +95,18 @@ print(f"Input shape:  {dummy_input.shape}")
 print(f"Output shape: {output_logits.shape}") # Expected: (BATCH_SIZE, NUM_CLASSES)
 print("\n✅ Zarvan model is ready for use!")
 ```
+## Citation
+If you use **Zarvan** in your research, please cite:
+```bibtex
+@article{sajjadi2025zarvan,
+  title={Zarvan: An Efficient Gated Architecture for Sequence Modeling with Linear Complexity},
+  author={Sajjadi, Yasser},
+  journal={Preprints.org},
+  doi={10.20944/preprints202507.2512.v1},
+  year={2025}
+}
+```
+You can also access the preprint here: https://www.preprints.org/manuscript/202507.2512/v1
 
 ## Contributing
 Contributions, issues, and feature requests are welcome! Feel free to check the issues page.
